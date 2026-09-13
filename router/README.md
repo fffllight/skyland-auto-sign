@@ -74,16 +74,50 @@ chmod 600 FEISHU_APP.json
 
 程序会在每次推送前获取短期 `tenant_access_token`，该临时凭证不会落盘。正常签到会汇总全部账号和角色后向指定个人推送一次；未配置 `FEISHU_APP.json` 时不会推送，`--check` 模式也不会推送。
 
-## 定时执行
+## 部署到路由器（Xiaomi AX6000 实测）
 
-在路由器上把命令交给 cron 即可，例如 OpenWrt 的 `/etc/crontabs/root`：
+小米/OpenWrt 的根分区是只读镜像（`touch /x` 报 `Read-only file system`），`/etc` 只是内存
+overlay（重启即丢），只有 `/data` 这类 ubi 卷可写且重启保留。所以二进制和配置都放
+`/data/skyland-sign/`，并用一个脚本包住 cron 调用：
 
 ```sh
-# 每天 09:07 签到，日志追加到持久化目录
-7 9 * * * /usr/sbin/skyland-sign-arm64 >> /root/skyland-sign.log 2>&1
+#!/bin/sh
+# 由 cron 每天调用：签到并把输出写入日志，日志只保留最近 200 行。
+# 传 check 参数时只做只读校验（--check），不签到也不推送，用于演练这条路径。
+umask 077
+DIR=/data/skyland-sign
+MODE=""
+[ "$1" = "check" ] && MODE="--check"
+echo "===== $(date '+%Y-%m-%d %H:%M:%S') 开始 =====" >> "$DIR/run.log"
+"$DIR/skyland-sign-arm64" $MODE --token-file "$DIR/TOKEN.txt" --feishu-config "$DIR/FEISHU_APP.json" >> "$DIR/run.log" 2>&1
+tail -n 200 "$DIR/run.log" > "$DIR/run.log.tmp" && mv "$DIR/run.log.tmp" "$DIR/run.log"
 ```
 
-注意不要写到重启即丢的 `/tmp`。退出码非零表示至少一个角色签到失败或推送失败，可以直接用它接告警。
+crontab 里只留一行（BusyBox crond 每分钟自动重读 `/etc/crontabs/root`，改完不用重启服务）：
+
+```sh
+0 3 * * * /data/skyland-sign/run.sh >/dev/null 2>&1
+```
+
+日志用 `tail -n 200` 自己封顶，不依赖 logrotate——`/etc/logrotate.d` 在只读根上、内存
+overlay 里加的配置重启就没了，不值得依赖。
+
+上线前演练一次，不消耗当天签到机会（`--check` 只认证不签到）：
+
+```sh
+sh /data/skyland-sign/run.sh check
+/data/skyland-sign/skyland-sign-arm64 --test-feishu --feishu-config /data/skyland-sign/FEISHU_APP.json
+```
+
+更新版本时用「先传临时名、比对 md5、再原子替换」，避免传输出错或路径短暂缺失：
+
+```sh
+ssh ax6000 'cat > /data/skyland-sign/skyland-sign-arm64.new && chmod 700 /data/skyland-sign/skyland-sign-arm64.new' < skyland-sign-arm64.upx
+ssh ax6000 'md5sum /data/skyland-sign/skyland-sign-arm64.new'   # 与本机 md5sum 比对
+ssh ax6000 'mv /data/skyland-sign/skyland-sign-arm64.new /data/skyland-sign/skyland-sign-arm64'
+```
+
+`/data` 一共 23 MB 上下，部署后记得删掉备份出来的旧二进制，删之前先确认新版本跑通过一次。
 
 ## 排障
 
